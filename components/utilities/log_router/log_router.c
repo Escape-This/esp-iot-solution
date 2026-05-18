@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 #include "log_router.h"
 #include "esp_log_color.h"
 
@@ -29,8 +30,12 @@ static const char *TRUNCATE_MESSAGE = LOG_ITALIC(LOG_COLOR_PURPLE) "" CONFIG_LOG
 static const char *TRUNCATE_MESSAGE = CONFIG_LOG_ROUTER_TRUNCATE_STRING "\n" ;
 #endif
 #endif
+
 // Global mutex for thread safety
 static SemaphoreHandle_t g_log_router_mutex = NULL;
+
+// Global timer used to for flush time-out
+static TimerHandle_t g_log_router_timer = NULL;
 
 // Custom debug output function
 static void log_router_debug_printf(const char *format, ...)
@@ -51,8 +56,8 @@ typedef struct _esp_log_router_slist_t {
     size_t buffer_size;                                            /*!< Buffer size for batch writing */
     size_t buffer_pos;                                             /*!< Current position in buffer */
     size_t flush_threshold;                                        /*!< Flush threshold */
-    uint32_t flush_timeout_ms;                                     /*!< Flush timeout in milliseconds */
-    uint32_t last_flush_time;                                      /*!< Last flush time */
+//    uint32_t flush_timeout_ms;                                     /*!< Flush timeout in milliseconds */
+//    uint32_t last_flush_time;                                      /*!< Last flush time */
     FILE *log_fp;
     esp_log_level_t level;
     SLIST_ENTRY(_esp_log_router_slist_t) next;
@@ -99,7 +104,7 @@ static esp_err_t esp_log_router_flush_buffer(esp_log_router_slist_t *item)
     fflush(item->log_fp);
     fsync(fileno(item->log_fp));
     item->buffer_pos = 0;
-    item->last_flush_time = (uint32_t)(esp_timer_get_time() / 1000);
+//    item->last_flush_time = (uint32_t)(esp_timer_get_time() / 1000);
 
     return ESP_OK;
 }
@@ -116,11 +121,11 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
         log_router_debug_printf("Flush buffer due to threshold\n");
     }
 
-    // Check if we need to flush due to timeout
-    if ((now - item->last_flush_time) >= item->flush_timeout_ms) {
-        should_flush = true;
-        log_router_debug_printf("Flush buffer due to timeout\n");
-    }
+//    // Check if we need to flush due to timeout
+//    if ((now - item->last_flush_time) >= item->flush_timeout_ms) {
+//        should_flush = true;
+//        log_router_debug_printf("Flush buffer due to timeout\n");
+//    }
 
     // Flush buffer if needed
     if (should_flush) {
@@ -189,6 +194,17 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
         uint32_t write_duration_us = esp_timer_get_time() - write_start_time;
         log_router_debug_printf("Direct write took %ums, size: %d, file: %s\n", write_duration_us / 1000, len, item->file_path);
 #endif
+    }
+
+    // Schedule a 'flush' run - if it isn't ticking down already, of course
+    if (item->buffer_pos > 0) {
+        if (pdFALSE == xTimerIsTimerActive(g_log_router_timer)) {
+            BaseType_t ret = xTimerStart(g_log_router_timer, portMAX_DELAY);
+            if (ret != pdPASS) {
+                ESP_RETURN_VOID_ON_ERROR(ESP_ERR_TIMEOUT, TAG, "Failed to start timer!");
+            }
+            log_router_debug_printf("Scheduled buffer flush in %d ms\n", CONFIG_LOG_ROUTER_FLUSH_TIMEOUT_MS);
+        }
     }
 
     return;
@@ -317,6 +333,38 @@ static void esp_log_router_shutdown(void)
     g_esp_log_router_keep_console = true;
 }
 
+static void log_router_timeout()
+{
+    log_router_debug_printf("Flush all buffers due to timeout...\n");
+
+    // Lock mutex for thread safety
+    xSemaphoreTake(g_log_router_mutex, portMAX_DELAY);
+
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+    uint64_t flush_start_time = esp_timer_get_time();
+    int flush_count = 0;
+#endif
+
+    // Flush all buffers with data in them
+    esp_log_router_slist_t *item;
+    SLIST_FOREACH(item, &g_esp_log_router_slist_head, next) {
+        if (item->buffer_pos > 0) {
+            esp_log_router_flush_buffer(item);
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+            flush_count++;
+#endif
+        }
+    }
+
+    // Release mutex
+    xSemaphoreGive(g_log_router_mutex);
+
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+    uint32_t flush_duration_us = esp_timer_get_time() - flush_start_time;
+    log_router_debug_printf("Flushing %d buffers took %ums", flush_count, flush_duration_us / 1000);
+#endif
+}
+
 esp_err_t esp_log_router_to_file(const char* file_path, const char* tag, esp_log_level_t level)
 {
     // Create mutex for thread safety, the first time this function is called.
@@ -326,6 +374,18 @@ esp_err_t esp_log_router_to_file(const char* file_path, const char* tag, esp_log
             ESP_LOGE(TAG, "Failed to create mutex for log router");
             return ESP_ERR_NO_MEM;
         }
+    }
+
+    // Also create an freeRTOS timer, in 'one-shot' mode.
+    g_log_router_timer = xTimerCreate(
+                             "log_router_flush",
+                             pdMS_TO_TICKS(CONFIG_LOG_ROUTER_FLUSH_TIMEOUT_MS),
+                             pdFALSE,
+                             NULL,
+                             log_router_timeout
+                         );
+    if (NULL == g_log_router_timer) {
+        ESP_RETURN_ON_ERROR(ESP_ERR_NO_MEM, TAG, "Failed to create timer!");
     }
 
     if (!file_path) {
@@ -404,9 +464,9 @@ esp_err_t esp_log_router_to_file(const char* file_path, const char* tag, esp_log
 
     // Calculate flush threshold based on percentage
     new_log_router->flush_threshold = (new_log_router->buffer_size * CONFIG_LOG_ROUTER_FLUSH_THRESHOLD_PERCENT) / 100;
-    new_log_router->flush_timeout_ms = CONFIG_LOG_ROUTER_FLUSH_TIMEOUT_MS;
+//    new_log_router->flush_timeout_ms = CONFIG_LOG_ROUTER_FLUSH_TIMEOUT_MS;
     new_log_router->buffer_pos = 0;
-    new_log_router->last_flush_time = (uint32_t)(esp_timer_get_time() / 1000);
+//    new_log_router->last_flush_time = (uint32_t)(esp_timer_get_time() / 1000);
 
     // Insert after the first node (if exists) or as first node
     if (SLIST_EMPTY(&g_esp_log_router_slist_head)) {
