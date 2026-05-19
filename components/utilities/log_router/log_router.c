@@ -75,6 +75,10 @@ static esp_err_t esp_log_router_flush_buffer(esp_log_router_slist_t *item)
         return ESP_FAIL;
     }
 
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+    uint64_t flush_start_time = esp_timer_get_time();
+#endif
+
     size_t written = fwrite(item->buffer, 1, item->buffer_pos, item->log_fp);
     if (written != item->buffer_pos) {
         log_router_debug_printf("Failed to write complete buffer to file, written: %zu, expected: %zu\n", written, item->buffer_pos);
@@ -106,6 +110,11 @@ static esp_err_t esp_log_router_flush_buffer(esp_log_router_slist_t *item)
     item->buffer_pos = 0;
 //    item->last_flush_time = (uint32_t)(esp_timer_get_time() / 1000);
 
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+    uint32_t flush_duration_us = esp_timer_get_time() - flush_start_time;
+    log_router_debug_printf("Flush operation took %ums, file: %s\n", flush_duration_us / 1000, item->file_path);
+#endif
+
     return ESP_OK;
 }
 
@@ -129,14 +138,8 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
 
     // Flush buffer if needed
     if (should_flush) {
-#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
-        uint64_t flush_start_time = esp_timer_get_time();
-#endif
         esp_err_t flush_ret = esp_log_router_flush_buffer(item);
-#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
-        uint32_t flush_duration_us = esp_timer_get_time() - flush_start_time;
-        log_router_debug_printf("Flush operation took %ums, file: %s\n", flush_duration_us / 1000, item->file_path);
-#endif
+
         if (flush_ret != ESP_OK) {
             log_router_debug_printf("Failed to flush buffer: %s\n", esp_err_to_name(flush_ret));
             // Flush failed, write directly to file
@@ -196,7 +199,7 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
 #endif
     }
 
-    // Schedule a 'flush' run - if it isn't ticking down already, of course
+    // Schedule a 'time-out flush' - if it isn't ticking down already, of course
     if (item->buffer_pos > 0) {
         if (pdFALSE == xTimerIsTimerActive(g_log_router_timer)) {
             BaseType_t ret = xTimerStart(g_log_router_timer, portMAX_DELAY);
