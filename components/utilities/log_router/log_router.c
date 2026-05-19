@@ -68,6 +68,7 @@ static bool g_esp_log_router_keep_console = true;                  /*!< Whether 
 static vprintf_like_t g_esp_log_router_vprintf = NULL;             /*!< Original vprintf function */
 static char dump_log_buffer[CONFIG_LOG_ROUTER_FORMAT_BUFFER_SIZE]; /*!< Buffer for dump log messages */
 static char vprintf_buffer[CONFIG_LOG_ROUTER_FORMAT_BUFFER_SIZE];  /*!< Buffer for formatted log messages */
+static bool g_deferred_flush;                                      /*!< Is a deferred flush already scheduled */
 
 static esp_err_t esp_log_router_flush_buffer(esp_log_router_slist_t *item)
 {
@@ -76,7 +77,7 @@ static esp_err_t esp_log_router_flush_buffer(esp_log_router_slist_t *item)
     }
 
 #ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
-    uint64_t flush_start_time = esp_timer_get_time();
+    int64_t flush_start_time = esp_timer_get_time();
 #endif
 
     size_t written = fwrite(item->buffer, 1, item->buffer_pos, item->log_fp);
@@ -112,22 +113,62 @@ static esp_err_t esp_log_router_flush_buffer(esp_log_router_slist_t *item)
 
 #ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
     uint32_t flush_duration_us = esp_timer_get_time() - flush_start_time;
-    log_router_debug_printf("Flush operation took %ums, file: %s\n", flush_duration_us / 1000, item->file_path);
+    log_router_debug_printf("Flushing %d bytes took %ums, file: %s\n", written, flush_duration_us / 1000, item->file_path);
 #endif
 
     return ESP_OK;
 }
 
+//! Used to flush buffers before they get full, without blocking the tasks calling ESP_LOG()
+//! xTimerPendFunctionCall() is used to make the 'timer' task run it, when higher-prioty tasks are idle
+static void cb_deferred_flush(void* pvParameter1, uint32_t ulParameter2)
+{
+    // Lock mutex for thread safety
+    xSemaphoreTake(g_log_router_mutex, portMAX_DELAY);
+
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+    int64_t flush_start_time = esp_timer_get_time();
+    int flush_count = 0;
+#endif
+
+    // Allow a new deferred flush to be scheduled
+    g_deferred_flush = false;
+
+    // Flush all buffers with data in them
+    esp_log_router_slist_t *item;
+    SLIST_FOREACH(item, &g_esp_log_router_slist_head, next) {
+        if (item->buffer_pos > item->flush_threshold) {
+            log_router_debug_printf("Executing deferred flush, file: %s\n", item->file_path);
+
+            esp_err_t flush_ret = esp_log_router_flush_buffer(item);
+            if (flush_ret != ESP_OK) {
+                log_router_debug_printf("Failed to flush buffer, file: %s\n", esp_err_to_name(flush_ret));
+            } else {
+                flush_count++;
+            }
+        }
+    }
+
+    // Release mutex
+    xSemaphoreGive(g_log_router_mutex);
+
+#ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
+    uint32_t flush_duration_us = esp_timer_get_time() - flush_start_time;
+    log_router_debug_printf("Flushing %d buffers took %ums", flush_count, flush_duration_us / 1000);
+#endif
+}
+
 static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, esp_log_router_slist_t *item, uint32_t now)
 {
-    bool should_flush = false;
+    bool need_flush = false;
 
     size_t len = n * size;
 
-    // Check if we need to flush due to threshold
-    if ((item->buffer_pos + len) >= item->flush_threshold) {
-        should_flush = true;
-        log_router_debug_printf("Flush buffer due to threshold\n");
+    // If the buffer's out of space, we'll need to flush it first.
+    // Usually the 'threshold flush' should have dealt with it first, but that's only if the timer task had a chance to run.
+    if ((item->buffer_pos + len) > item->buffer_size) {
+        need_flush = true;
+        log_router_debug_printf("Flush buffer to make space for new message\n");
     }
 
 //    // Check if we need to flush due to timeout
@@ -137,7 +178,7 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
 //    }
 
     // Flush buffer if needed
-    if (should_flush) {
+    if (need_flush) {
         esp_err_t flush_ret = esp_log_router_flush_buffer(item);
 
         if (flush_ret != ESP_OK) {
@@ -173,7 +214,7 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
     } else {
         // Buffer is too small, write directly to file
 #ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
-        uint64_t write_start_time = esp_timer_get_time();
+        int64_t write_start_time = esp_timer_get_time();
 #endif
         size_t written = fwrite(buffer, 1, len, item->log_fp);
         if (written != len) {
@@ -197,6 +238,25 @@ static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, 
         uint32_t write_duration_us = esp_timer_get_time() - write_start_time;
         log_router_debug_printf("Direct write took %ums, size: %d, file: %s\n", write_duration_us / 1000, len, item->file_path);
 #endif
+    }
+
+    // If the buffer is getting full, schedule a flush for when the CPU is idle
+    // The flush is done by the low-priority 'timer' task, to reduce delays in the task calling ESP_LOG()
+    if (item->buffer_pos > item->flush_threshold) {
+        if (!g_deferred_flush) {
+
+            BaseType_t ret = xTimerPendFunctionCall(cb_deferred_flush, NULL, 0, 0);
+            if (ret == pdTRUE) {
+                g_deferred_flush = true;
+                log_router_debug_printf("Defer buffer flush, file: %s\n", item->file_path);
+            } else {
+                // The timer daemon's task queue was full - probably hasn't had a chance to run. That's ok,
+                // if our buffer fills up, it'll just do the write from within the task calling ESP_LOG()
+                log_router_debug_printf("Failed to defer buffer flush, file: %s\n", item->file_path);
+            }
+        } else {
+            log_router_debug_printf("Already a deferred flush, file: %s\n", item->file_path);
+        }
     }
 
     // Schedule a 'time-out flush' - if it isn't ticking down already, of course
@@ -344,7 +404,7 @@ static void log_router_timeout()
     xSemaphoreTake(g_log_router_mutex, portMAX_DELAY);
 
 #ifdef CONFIG_LOG_ROUTER_DEBUG_OUTPUT
-    uint64_t flush_start_time = esp_timer_get_time();
+    int64_t flush_start_time = esp_timer_get_time();
     int flush_count = 0;
 #endif
 
