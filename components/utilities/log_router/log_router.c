@@ -158,7 +158,7 @@ static void cb_deferred_flush(void* pvParameter1, uint32_t ulParameter2)
 #endif
 }
 
-static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, esp_log_router_slist_t *item, uint32_t now)
+static void router_fwrite(const void *__restrict buffer, size_t size, size_t n, esp_log_router_slist_t *item)
 {
     bool need_flush = false;
 
@@ -312,7 +312,6 @@ int esp_log_router_flash_vprintf(const char *format, va_list args)
         }
 
         vprintf_buffer[len] = '\0';
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
         // Extract tag from formatted buffer (find the colon ':')
         const char *colon_pos = strchr(vprintf_buffer, ':');
@@ -342,11 +341,11 @@ int esp_log_router_flash_vprintf(const char *format, va_list args)
             bool tag_match = (item->tag == NULL) || (tag_len > 0 && strncmp(tag_start, item->tag, tag_len) == 0 && item->tag[tag_len] == '\0');
 
             if (level_match && tag_match && item->log_fp) {
-                router_fwrite(vprintf_buffer, 1, len, item, now);
+                router_fwrite(vprintf_buffer, 1, len, item);
 
 #if (CONFIG_LOG_ROUTER_APPEND_STRING_ON_TRUNCATE)
                 if (trunc_b > 0) {
-                    router_fwrite(TRUNCATE_MESSAGE, 1, strlen(TRUNCATE_MESSAGE), item, now);
+                    router_fwrite(TRUNCATE_MESSAGE, 1, strlen(TRUNCATE_MESSAGE), item);
                 }
 #endif
             }
